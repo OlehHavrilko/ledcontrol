@@ -115,11 +115,10 @@ class BleController:
 
         last_exc: Exception | None = None
         for attempt in range(1, 4):
-            client = BleakClient(raw_device or address)
+            client = self._make_client(raw_device or address)
             try:
                 self._log(f"Connecting (attempt {attempt}/3) to {address}…")
                 await client.connect(timeout=10.0)
-                client.set_disconnected_callback(self._on_disconnected)
                 self._client = client
                 await self._validate_write_characteristic()
                 self._emit_state(connected=True, device=dev)
@@ -137,6 +136,27 @@ class BleController:
 
         self._emit_state(connected=False, device=None, last_error=str(last_exc) if last_exc else "Connect failed")
         raise last_exc or RuntimeError("Connect failed")
+
+    def _make_client(self, target: Any) -> BleakClient:
+        # Bleak API differs across versions:
+        # - some support BleakClient(..., disconnected_callback=...)
+        # - others require client.set_disconnected_callback(...)
+        try:
+            client = BleakClient(target, disconnected_callback=self._on_disconnected)
+        except TypeError:
+            client = BleakClient(target)
+            if hasattr(client, "set_disconnected_callback"):
+                try:
+                    client.set_disconnected_callback(self._on_disconnected)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        else:
+            if hasattr(client, "set_disconnected_callback"):
+                try:
+                    client.set_disconnected_callback(self._on_disconnected)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        return client
 
     async def disconnect(self) -> None:
         if not self._client:
