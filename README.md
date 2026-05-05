@@ -1,8 +1,8 @@
 # ELK-BLEDOM LED Strip Controller (Windows Desktop)
 
-![Windows build](https://github.com/OlehHavrilko/ledcontrol/actions/workflows/windows-build.yml/badge.svg)
-![Latest release](https://img.shields.io/github/v/release/OlehHavrilko/ledcontrol)
-![Downloads](https://img.shields.io/github/downloads/OlehHavrilko/ledcontrol/total)
+[![Windows build](https://github.com/OlehHavrilko/ledcontrol/actions/workflows/windows-build.yml/badge.svg)](https://github.com/OlehHavrilko/ledcontrol/actions/workflows/windows-build.yml)
+[![Latest release](https://img.shields.io/github/v/release/OlehHavrilko/ledcontrol)](https://github.com/OlehHavrilko/ledcontrol/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/OlehHavrilko/ledcontrol/total)](https://github.com/OlehHavrilko/ledcontrol/releases)
 
 Modern desktop app (Python + CustomTkinter) to control ELK-BLEDOM BLE RGB LED strips using the common 9-byte ELK-BLEDOM protocol frames.
 
