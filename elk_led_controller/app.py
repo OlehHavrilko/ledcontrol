@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 import re
 import tkinter as tk
-from tkinter import colorchooser
 from typing import Any
 
 import customtkinter as ctk
 
 from .ble_controller import BleController, ConnectionState, NAME_SUBSTR, WRITE_UUID_DEFAULT
 from .config import AppConfig
-from .protocol import cmd_brightness, cmd_effect, cmd_power, cmd_rgb
+from .api import ApiConfig, start_api_in_thread
+from .service import LedService, LedState
 
 
 EFFECTS: list[tuple[int, str]] = [
@@ -72,21 +72,56 @@ class LedControllerApp(ctk.CTk):
         self._ble = BleController(
             on_state=self._on_ble_state_from_thread,
             on_last_command=self._on_last_command_from_thread,
+            on_log=self._on_log_from_thread,
         )
         self._ble.start()
+        self._ble.set_write_delay_ms(int(self.cfg.data.get("write_delay_ms", 50)))
 
         self._connected = False
-        self._power_on = True
+        self._power_on = bool(self.cfg.data.get("default_power_on", True))
         self._device_label = ""
         self._rssi_label = ""
         self._last_command = ""
+        self._logs: list[str] = []
         self._color_debounce: str | None = None
         self._brightness_debounce: str | None = None
 
+        last_color = self.cfg.data.get("last_color", [255, 100, 0])
+        self._service = LedService(
+            self._ble,
+            LedState(
+                power_on=self._power_on,
+                r=int(last_color[0]),
+                g=int(last_color[1]),
+                b=int(last_color[2]),
+                brightness_pct=int(self.cfg.data.get("last_brightness", 80)),
+            ),
+        )
+        self._api_thread = None
+
         self._build_ui()
-        self.bind("<space>", lambda _e: self._toggle_power())
+        self._bind_shortcuts()
 
         self.after(200, self._startup_autoreconnect)
+        self._maybe_start_api()
+
+    def _maybe_start_api(self) -> None:
+        http = self.cfg.data.get("http_api", {}) or {}
+        if not bool(http.get("enabled", False)):
+            return
+        host = str(http.get("host") or "127.0.0.1")
+        port = int(http.get("port") or 8787)
+        self._api_thread = start_api_in_thread(self._service, ApiConfig(host=host, port=port))
+        self._append_log(f"HTTP API started on http://{host}:{port}")
+
+    def _bind_shortcuts(self) -> None:
+        self.bind("<space>", lambda _e: self._toggle_power())
+        self.bind("<Up>", lambda _e: self._bump_brightness(+5))
+        self.bind("<Down>", lambda _e: self._bump_brightness(-5))
+        self.bind("<Left>", lambda _e: self._bump_speed(-10))
+        self.bind("<Right>", lambda _e: self._bump_speed(+10))
+        for i, (_name, rgb) in enumerate(PALETTE, start=1):
+            self.bind(f"<Control-Key-{i}>", lambda _e, c=rgb: self._set_color(*c))
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
@@ -132,7 +167,9 @@ class LedControllerApp(ctk.CTk):
         self._power_frame = ctk.CTkFrame(self, corner_radius=12)
         self._power_frame.grid(row=2, column=0, padx=16, pady=(0, 10), sticky="ew")
         self._power_frame.grid_columnconfigure(0, weight=1)
-        self._power_btn = ctk.CTkButton(self._power_frame, text="POWER ON", height=46, command=self._toggle_power)
+        self._power_btn = ctk.CTkButton(
+            self._power_frame, text="POWER ON" if self._power_on else "POWER OFF", height=46, command=self._toggle_power
+        )
         self._power_btn.grid(row=0, column=0, padx=14, pady=14, sticky="ew")
 
         self._color_frame = ctk.CTkFrame(self, corner_radius=12)
@@ -144,8 +181,7 @@ class LedControllerApp(ctk.CTk):
         self._preview.grid(row=0, column=1, padx=10, pady=(12, 6), sticky="w")
         self._preview_rect = self._preview.create_rectangle(0, 0, 44, 18, outline="", fill="#ff6400")
 
-        self._pick_btn = ctk.CTkButton(self._color_frame, text="Pick…", width=90, command=self._open_color_picker)
-        self._pick_btn.grid(row=0, column=2, padx=(10, 14), pady=(12, 6))
+        # Intentionally no modal color wheel here: sliders + HEX provide non-blocking "live" UX.
 
         self._r_var = tk.IntVar(value=int(self.cfg.data.get("last_color", [255, 100, 0])[0]))
         self._g_var = tk.IntVar(value=int(self.cfg.data.get("last_color", [255, 100, 0])[1]))
@@ -201,27 +237,41 @@ class LedControllerApp(ctk.CTk):
 
         self._effects_frame = ctk.CTkFrame(self, corner_radius=12)
         self._effects_frame.grid(row=7, column=0, padx=16, pady=(0, 10), sticky="ew")
-        self._effects_frame.grid_columnconfigure(1, weight=1)
+        self._effects_frame.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(self._effects_frame, text="Effect").grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
+        ctk.CTkLabel(self._effects_frame, text="Effects").grid(row=0, column=0, padx=14, pady=(12, 6), sticky="w")
         self._effect_map = {name: mode for mode, name in EFFECTS}
         effect_values = [name for _mode, name in EFFECTS]
         self._effect_var = tk.StringVar(value=effect_values[0])
-        self._effect_menu = ctk.CTkOptionMenu(self._effects_frame, variable=self._effect_var, values=effect_values)
-        self._effect_menu.grid(row=0, column=1, padx=10, pady=(12, 6), sticky="ew")
 
-        ctk.CTkLabel(self._effects_frame, text="Speed").grid(row=1, column=0, padx=14, pady=(0, 12), sticky="w")
+        grid = ctk.CTkFrame(self._effects_frame, corner_radius=10)
+        grid.grid(row=1, column=0, padx=14, pady=(0, 8), sticky="ew")
+        for c in range(6):
+            grid.grid_columnconfigure(c, weight=1)
+        for i, (mode, name) in enumerate(EFFECTS):
+            r = i // 6
+            c = i % 6
+            btn = ctk.CTkButton(
+                grid,
+                text=name.split(" ")[0],
+                width=90,
+                height=28,
+                command=lambda m=mode, n=name: self._apply_effect(mode=m, name=n),
+            )
+            btn.grid(row=r, column=c, padx=4, pady=4, sticky="ew")
+
+        ctk.CTkLabel(self._effects_frame, text="Speed").grid(row=2, column=0, padx=14, pady=(0, 12), sticky="w")
         self._speed_var = tk.IntVar(value=120)
         self._speed_slider = ctk.CTkSlider(
             self._effects_frame, from_=0, to=255, number_of_steps=255, command=self._on_speed_slider
         )
         self._speed_slider.set(self._speed_var.get())
-        self._speed_slider.grid(row=1, column=1, padx=10, pady=(0, 12), sticky="ew")
+        self._speed_slider.grid(row=2, column=0, padx=(90, 90), pady=(0, 12), sticky="ew")
         self._speed_label = ctk.CTkLabel(self._effects_frame, text=str(self._speed_var.get()))
-        self._speed_label.grid(row=1, column=2, padx=(10, 14), pady=(0, 12), sticky="e")
+        self._speed_label.grid(row=2, column=0, padx=(14, 14), pady=(0, 12), sticky="e")
 
-        self._apply_effect_btn = ctk.CTkButton(self._effects_frame, text="Apply Effect", command=self._apply_effect)
-        self._apply_effect_btn.grid(row=2, column=0, padx=14, pady=(0, 14), sticky="w", columnspan=3)
+        hint = ctk.CTkLabel(self._effects_frame, text="Tip: click an effect button to apply.", text_color=("gray70", "gray70"))
+        hint.grid(row=3, column=0, padx=14, pady=(0, 14), sticky="w")
 
         self._scenes_frame = ctk.CTkFrame(self, corner_radius=12)
         self._scenes_frame.grid(row=8, column=0, padx=16, pady=(0, 10), sticky="ew")
@@ -241,8 +291,16 @@ class LedControllerApp(ctk.CTk):
         self._scene_list.grid(row=1, column=0, padx=14, pady=(0, 14), sticky="ew")
         self._render_scenes()
 
+        self._debug_frame = ctk.CTkFrame(self, corner_radius=12)
+        self._debug_frame.grid(row=9, column=0, padx=16, pady=(0, 10), sticky="ew")
+        self._debug_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self._debug_frame, text="Debug").grid(row=0, column=0, padx=14, pady=(10, 6), sticky="w")
+        self._debug_text = ctk.CTkTextbox(self._debug_frame, height=90)
+        self._debug_text.grid(row=1, column=0, padx=14, pady=(0, 12), sticky="ew")
+        self._debug_text.configure(state="disabled")
+
         self._status = ctk.CTkFrame(self, corner_radius=0)
-        self._status.grid(row=9, column=0, padx=0, pady=(0, 0), sticky="ew")
+        self._status.grid(row=10, column=0, padx=0, pady=(0, 0), sticky="ew")
         self._status.grid_columnconfigure(2, weight=1)
 
         self._dot = ctk.CTkLabel(self._status, text="●", text_color="red", font=("Segoe UI", 14, "bold"))
@@ -292,6 +350,9 @@ class LedControllerApp(ctk.CTk):
         setattr(self, f"_slider_{label.lower()}", slider)
 
     def _startup_autoreconnect(self) -> None:
+        if not bool(self.cfg.data.get("auto_reconnect", True)):
+            self._scan_devices()
+            return
         last = self.cfg.data.get("last_device", {}) or {}
         addr = (last.get("address") or "").strip()
         name = (last.get("name") or "").strip()
@@ -356,7 +417,7 @@ class LedControllerApp(ctk.CTk):
 
         async def do_connect() -> None:
             await self._ble.connect(address=address, name=name, write_uuid=write_uuid)
-            await self._ble.write(cmd_power(True), label="Power ON (post-connect)")
+            self._ble.set_last_device(address=address, name=name, write_uuid=write_uuid)
 
         fut = self._ble.submit(do_connect())
 
@@ -372,6 +433,8 @@ class LedControllerApp(ctk.CTk):
             self.cfg.data["last_device"] = {"address": address, "name": name, "write_uuid": write_uuid}
             self.cfg.save()
             self._toast("Connected")
+            if bool(self.cfg.data.get("default_power_on", True)) and self._power_on:
+                self._service.set_power(True)
 
         self.after(50, lambda: self._poll_future(fut, done))
 
@@ -395,18 +458,8 @@ class LedControllerApp(ctk.CTk):
     def _toggle_power(self) -> None:
         self._power_on = not self._power_on
         self._power_btn.configure(text="POWER ON" if self._power_on else "POWER OFF")
-        if not self._connected:
-            return
-        data = cmd_power(self._power_on)
-        label = "Power ON" if self._power_on else "Power OFF"
-        self._send_command(data, label)
-
-    def _open_color_picker(self) -> None:
-        rgb, hex_color = colorchooser.askcolor(color=self._hex_var.get(), title="Pick Color")
-        if not hex_color:
-            return
-        self._hex_var.set(hex_color)
-        self._apply_hex()
+        if self._connected:
+            self._service.set_power(self._power_on)
 
     def _apply_hex(self) -> None:
         text = self._hex_var.get().strip()
@@ -452,9 +505,8 @@ class LedControllerApp(ctk.CTk):
         r, g, b = self._r_var.get(), self._g_var.get(), self._b_var.get()
         self.cfg.data["last_color"] = [r, g, b]
         self.cfg.save()
-        if not self._connected:
-            return
-        self._send_command(cmd_rgb(r, g, b), f"RGB {r},{g},{b}")
+        if self._connected:
+            self._service.set_color(r, g, b)
 
     def _on_brightness_slider(self, value: float) -> None:
         pct = int(round(value))
@@ -469,24 +521,23 @@ class LedControllerApp(ctk.CTk):
         pct = int(self._brightness_var.get())
         self.cfg.data["last_brightness"] = pct
         self.cfg.save()
-        if not self._connected:
-            return
-        val = int(round(pct * 255 / 100))
-        self._send_command(cmd_brightness(val), f"Brightness {pct}%")
+        if self._connected:
+            self._service.set_brightness_pct(pct)
 
     def _on_speed_slider(self, value: float) -> None:
         v = int(round(value))
         self._speed_var.set(v)
         self._speed_label.configure(text=str(v))
 
-    def _apply_effect(self) -> None:
-        mode_name = self._effect_var.get()
-        mode = int(self._effect_map.get(mode_name, 0))
+    def _apply_effect(self, *, mode: int | None = None, name: str | None = None) -> None:
+        mode_name = name or self._effect_var.get()
+        self._effect_var.set(mode_name)
+        mode_val = int(mode if mode is not None else self._effect_map.get(mode_name, 0))
         speed = int(self._speed_var.get())
         if not self._connected:
             self._toast("Not connected")
             return
-        self._send_command(cmd_effect(mode, speed), f"Effect {mode_name} @ {speed}")
+        self._service.set_effect(mode_val, speed)
 
     def _save_scene(self) -> None:
         name = self._scene_name_var.get().strip()
@@ -556,10 +607,10 @@ class LedControllerApp(ctk.CTk):
             self._toast("Scene loaded (not connected)")
             return
 
-        self._send_command(cmd_power(self._power_on), "Power (scene)")
-        self._send_command(cmd_rgb(self._r_var.get(), self._g_var.get(), self._b_var.get()), "Color (scene)")
-        self._send_brightness_now()
-        self._send_command(cmd_effect(int(self._effect_map.get(self._effect_var.get(), 0)), spd), "Effect (scene)")
+        self._service.set_power(self._power_on)
+        self._service.set_color(self._r_var.get(), self._g_var.get(), self._b_var.get())
+        self._service.set_brightness_pct(int(self._brightness_var.get()))
+        self._service.set_effect(int(self._effect_map.get(self._effect_var.get(), 0)), spd)
 
     def _del_scene(self, name: str) -> None:
         scenes: list[dict[str, Any]] = list(self.cfg.data.get("scenes", []) or [])
@@ -588,25 +639,26 @@ class LedControllerApp(ctk.CTk):
             hex_color = self._rgb_to_hex(r, g, b)
             btn.configure(text=hex_color, command=lambda c=recent[i]: self._set_color(c[0], c[1], c[2]))
 
-    def _send_command(self, data: bytes, label: str) -> None:
-        async def do_write() -> None:
-            await self._ble.write(data, label=label)
+    def _bump_brightness(self, delta: int) -> None:
+        v = int(self._brightness_var.get()) + int(delta)
+        v = max(0, min(100, v))
+        self._brightness_slider.set(v)
+        self._on_brightness_slider(float(v))
 
-        fut = self._ble.submit(do_write())
-
-        def done() -> None:
-            try:
-                fut.result()
-            except Exception as e:
-                self._toast(f"Write failed: {self._friendly_ble_error(e)}")
-
-        self.after(50, lambda: self._poll_future(fut, done))
+    def _bump_speed(self, delta: int) -> None:
+        v = int(self._speed_var.get()) + int(delta)
+        v = max(0, min(255, v))
+        self._speed_slider.set(v)
+        self._on_speed_slider(float(v))
 
     def _on_ble_state_from_thread(self, state: ConnectionState) -> None:
         self.after(0, lambda: self._on_ble_state(state))
 
     def _on_last_command_from_thread(self, label: str) -> None:
         self.after(0, lambda: self._set_last_command(label))
+
+    def _on_log_from_thread(self, msg: str) -> None:
+        self.after(0, lambda: self._append_log(msg))
 
     def _on_ble_state(self, state: ConnectionState) -> None:
         self._connected = bool(state.connected)
@@ -622,6 +674,7 @@ class LedControllerApp(ctk.CTk):
     def _set_last_command(self, label: str) -> None:
         self._last_command = label
         self._refresh_status_bar()
+        self._append_log(f"CMD: {label}")
 
     def _refresh_status_bar(self) -> None:
         self._dot.configure(text_color="green" if self._connected else "red")
@@ -643,6 +696,14 @@ class LedControllerApp(ctk.CTk):
         frame.pack(fill="both", expand=True)
         ctk.CTkLabel(frame, text=message, padx=12, pady=10).pack()
         t.after(2200, t.destroy)
+
+    def _append_log(self, msg: str) -> None:
+        self._logs.append(msg)
+        self._logs = self._logs[-200:]
+        self._debug_text.configure(state="normal")
+        self._debug_text.delete("1.0", "end")
+        self._debug_text.insert("end", "\n".join(self._logs) + "\n")
+        self._debug_text.configure(state="disabled")
 
     def _poll_future(self, fut: "asyncio.Future", on_done: callable) -> None:
         if fut.done():

@@ -22,6 +22,28 @@ python main.py
 
 The app will scan for devices whose name contains `ELK-BLEDOM`. It saves `config.json` on first run and auto-reconnects to the last device when possible.
 
+## Config
+
+`config.json` (auto-created) now also supports:
+
+```json
+{
+  "auto_reconnect": true,
+  "write_delay_ms": 50,
+  "default_power_on": true,
+  "http_api": { "enabled": false, "host": "127.0.0.1", "port": 8787 }
+}
+```
+
+## HTTP API (optional)
+
+Enable `http_api.enabled=true` in `config.json`, restart the app, then use:
+
+- `POST /color?r=255&g=0&b=0`
+- `POST /power?on=true`
+- `POST /brightness?pct=80`
+- `POST /effect?mode=3&speed=120`
+
 ## Build native Windows `.exe` + installer
 
 ### 1) Build the app folder (PyInstaller)

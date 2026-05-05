@@ -16,6 +16,10 @@ DEFAULT_CONFIG = {
     "last_brightness": 80,
     "recent_colors": [],
     "scenes": [],
+    "auto_reconnect": True,
+    "write_delay_ms": 50,
+    "default_power_on": True,
+    "http_api": {"enabled": False, "host": "127.0.0.1", "port": 8787},
 }
 
 
@@ -49,4 +53,3 @@ def _deep_update(dst: dict[str, Any], src: dict[str, Any]) -> None:
             _deep_update(dst[k], v)  # type: ignore[index]
         else:
             dst[k] = v
-

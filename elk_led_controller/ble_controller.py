@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from dataclasses import dataclass
 from typing import Callable, Coroutine, Optional
@@ -27,6 +28,7 @@ class BleController:
         self,
         on_state: Callable[[ConnectionState], None] | None = None,
         on_last_command: Callable[[str], None] | None = None,
+        on_log: Callable[[str], None] | None = None,
     ) -> None:
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -38,6 +40,13 @@ class BleController:
 
         self._on_state = on_state
         self._on_last_command = on_last_command
+        self._on_log = on_log
+
+        self._queue: asyncio.Queue[tuple[bytes, str]] | None = None
+        self._worker_task: asyncio.Task | None = None
+        self._write_delay_s: float = 0.05
+
+        self._last_device: dict[str, str] | None = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -47,6 +56,7 @@ class BleController:
         self._loop_ready.wait(timeout=5)
         if not self._loop:
             raise RuntimeError("BLE event loop failed to start")
+        self.submit(self._ensure_worker())
 
     def stop(self) -> None:
         if not self._loop:
@@ -69,6 +79,12 @@ class BleController:
     def set_write_uuid(self, uuid: str) -> None:
         self._write_uuid = uuid
 
+    def set_write_delay_ms(self, delay_ms: int) -> None:
+        self._write_delay_s = max(0.0, int(delay_ms) / 1000.0)
+
+    def set_last_device(self, *, address: str, name: str, write_uuid: str | None = None) -> None:
+        self._last_device = {"address": address, "name": name, "write_uuid": write_uuid or self._write_uuid}
+
     async def scan(self, timeout: float = 5.0) -> list[DeviceInfo]:
         devices = await BleakScanner.discover(timeout=timeout)
         found: list[DeviceInfo] = []
@@ -81,24 +97,38 @@ class BleController:
 
     async def connect(self, address: str, name: str = "", write_uuid: Optional[str] = None) -> None:
         await self.disconnect()
+        await self._ensure_worker()
+
         self._write_uuid = write_uuid or self._write_uuid
         self._state.last_error = None
-        self._emit_state(connected=False, device=DeviceInfo(address=address, name=name or address))
+        dev = DeviceInfo(address=address, name=name or address)
+        self._emit_state(connected=False, device=dev)
+        self._last_device = {"address": address, "name": dev.name, "write_uuid": self._write_uuid}
 
-        client = BleakClient(address)
-        try:
-            await client.connect()
-            client.set_disconnected_callback(self._on_disconnected)
-            self._client = client
-            self._emit_state(connected=True, device=DeviceInfo(address=address, name=name or address))
-        except Exception as e:
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            client = BleakClient(address)
             try:
-                await client.disconnect()
-            except Exception:
-                pass
-            self._client = None
-            self._emit_state(connected=False, device=None, last_error=str(e))
-            raise
+                self._log(f"Connecting (attempt {attempt}/3) to {address}…")
+                await client.connect()
+                client.set_disconnected_callback(self._on_disconnected)
+                self._client = client
+                await self._validate_write_characteristic()
+                self._emit_state(connected=True, device=dev)
+                self._log("Connected.")
+                return
+            except Exception as e:
+                last_exc = e
+                self._log(f"Connect failed: {e}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                self._client = None
+                await asyncio.sleep(0.25 * attempt)
+
+        self._emit_state(connected=False, device=None, last_error=str(last_exc) if last_exc else "Connect failed")
+        raise last_exc or RuntimeError("Connect failed")
 
     async def disconnect(self) -> None:
         if not self._client:
@@ -111,12 +141,26 @@ class BleController:
         finally:
             self._emit_state(connected=False)
 
+    async def ensure_connection(self) -> None:
+        if self._client and getattr(self._client, "is_connected", False):
+            return
+        if not self._last_device:
+            raise RuntimeError("No last device configured")
+        await self.connect(
+            address=self._last_device["address"],
+            name=self._last_device.get("name", ""),
+            write_uuid=self._last_device.get("write_uuid", self._write_uuid),
+        )
+
+    async def safe_write(self, data: bytes, label: str = "") -> None:
+        await self._ensure_worker()
+        await self.ensure_connection()
+        assert self._queue is not None
+        await self._queue.put((data, label))
+
     async def write(self, data: bytes, label: str = "") -> None:
-        if not self._client:
-            raise RuntimeError("Not connected")
-        await self._client.write_gatt_char(self._write_uuid, data, response=False)
-        if self._on_last_command:
-            self._on_last_command(label or data.hex(" "))
+        # Back-compat: enqueue via worker.
+        await self.safe_write(data, label=label)
 
     def _run_loop(self) -> None:
         loop = asyncio.new_event_loop()
@@ -132,9 +176,57 @@ class BleController:
             await self.disconnect()
         except Exception:
             pass
+        if self._worker_task:
+            self._worker_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._worker_task
 
     def _on_disconnected(self, _client: BleakClient) -> None:
         self._emit_state(connected=False, last_error="Disconnected")
+        self._log("Disconnected.")
+
+    async def _ensure_worker(self) -> None:
+        if self._queue is None:
+            self._queue = asyncio.Queue()
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker(), name="ble-writer")
+
+    async def _worker(self) -> None:
+        assert self._queue is not None
+        while True:
+            data, label = await self._queue.get()
+            try:
+                await self.ensure_connection()
+                if not self._client:
+                    raise RuntimeError("Not connected")
+                await self._client.write_gatt_char(self._write_uuid, data, response=False)
+                if self._on_last_command:
+                    self._on_last_command(label or data.hex(" "))
+                await asyncio.sleep(self._write_delay_s)
+            except Exception as e:
+                self._emit_state(connected=False, last_error=str(e))
+                self._log(f"Write error: {e}")
+                await asyncio.sleep(0.2)
+
+    async def _validate_write_characteristic(self) -> None:
+        if not self._client:
+            return
+        # Ensure the UUID exists on the device; fallback to finding a writable characteristic.
+        services = await self._client.get_services()
+        if self._write_uuid in services.characteristics:
+            return
+        for svc in services:
+            for ch in svc.characteristics:
+                props = {p.lower() for p in (ch.properties or [])}
+                if "write-without-response" in props or "write" in props:
+                    self._write_uuid = str(ch.uuid)
+                    self._log(f"Write UUID not found; falling back to {self._write_uuid}")
+                    return
+        raise RuntimeError("Device has no writable characteristic")
+
+    def _log(self, msg: str) -> None:
+        if self._on_log:
+            self._on_log(msg)
 
     def _emit_state(
         self,
@@ -151,4 +243,3 @@ class BleController:
             self._state.last_error = None if last_error is None else last_error  # type: ignore[assignment]
         if self._on_state:
             self._on_state(self._state)
-
