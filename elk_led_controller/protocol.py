@@ -39,4 +39,4 @@ class DeviceInfo:
     address: str
     name: str
     rssi: int | None = None
-
+    raw: object | None = None

@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import threading
 from dataclasses import dataclass
-from typing import Callable, Coroutine, Optional
+from typing import Any, Callable, Coroutine, Optional
 
 from bleak import BleakClient, BleakScanner
 
@@ -91,11 +91,18 @@ class BleController:
         for d in devices:
             name = (d.name or "").strip()
             if NAME_SUBSTR.lower() in name.lower():
-                found.append(DeviceInfo(address=d.address, name=name, rssi=getattr(d, "rssi", None)))
+                found.append(DeviceInfo(address=d.address, name=name, rssi=getattr(d, "rssi", None), raw=d))
         found.sort(key=lambda x: (x.rssi is None, -(x.rssi or -999)))
         return found
 
-    async def connect(self, address: str, name: str = "", write_uuid: Optional[str] = None) -> None:
+    async def connect(
+        self,
+        address: str,
+        name: str = "",
+        write_uuid: Optional[str] = None,
+        *,
+        raw_device: Any | None = None,
+    ) -> None:
         await self.disconnect()
         await self._ensure_worker()
 
@@ -107,10 +114,10 @@ class BleController:
 
         last_exc: Exception | None = None
         for attempt in range(1, 4):
-            client = BleakClient(address)
+            client = BleakClient(raw_device or address)
             try:
                 self._log(f"Connecting (attempt {attempt}/3) to {address}…")
-                await client.connect()
+                await client.connect(timeout=10.0)
                 client.set_disconnected_callback(self._on_disconnected)
                 self._client = client
                 await self._validate_write_characteristic()

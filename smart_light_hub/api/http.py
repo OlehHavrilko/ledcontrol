@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi import WebSocket
 
 from ..core.engine import CoreEngine
 from ..services.light import LightService
+from .websocket import state_websocket
 
 
 def create_app(engine: CoreEngine) -> FastAPI:
@@ -38,5 +40,8 @@ def create_app(engine: CoreEngine) -> FastAPI:
     async def light_effect(entity_id: str, mode: int, speed: int):
         return await light.set_effect(entity_id, mode, speed)
 
-    return app
+    @app.websocket("/ws")
+    async def ws_endpoint(ws: WebSocket):
+        await state_websocket(engine, ws)
 
+    return app

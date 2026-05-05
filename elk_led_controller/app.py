@@ -369,9 +369,8 @@ class LedControllerApp(ctk.CTk):
         self._device_menu.configure(values=["Scanning…"])
         self._device_var.set("Scanning…")
 
-        async def do_scan() -> list[dict[str, Any]]:
-            found = await self._ble.scan(timeout=5.0)
-            return [{"address": d.address, "name": d.name, "rssi": d.rssi} for d in found]
+        async def do_scan() -> list[Any]:
+            return await self._ble.scan(timeout=5.0)
 
         fut = self._ble.submit(do_scan())
 
@@ -388,8 +387,8 @@ class LedControllerApp(ctk.CTk):
                 self._device_menu.configure(values=["(none found)"])
                 self._device_var.set("(none found)")
                 return
-            values = [f"{r['name']}  ({r['address']})  RSSI {r.get('rssi')}" for r in results]
-            self._scan_results = results
+            values = [f"{d.name}  ({d.address})  RSSI {d.rssi}" for d in results]
+            self._scan_results = results  # list[DeviceInfo]
             self._device_menu.configure(values=values)
             self._device_var.set(values[0])
 
@@ -409,14 +408,24 @@ class LedControllerApp(ctk.CTk):
             return
         address = match.group(1)
         name = choice.split("(")[0].strip()
-        self._connect(address=address, name=name, write_uuid=self._uuid_var.get().strip() or WRITE_UUID_DEFAULT)
+        raw = None
+        for d in getattr(self, "_scan_results", []) or []:
+            if getattr(d, "address", None) == address:
+                raw = getattr(d, "raw", None)
+                break
+        self._connect(
+            address=address,
+            name=name,
+            write_uuid=self._uuid_var.get().strip() or WRITE_UUID_DEFAULT,
+            raw_device=raw,
+        )
 
-    def _connect(self, address: str, name: str, write_uuid: str) -> None:
+    def _connect(self, address: str, name: str, write_uuid: str, raw_device: Any | None = None) -> None:
         self._connect_btn.configure(state="disabled", text="Connecting…")
         self._uuid_entry.configure(state="disabled")
 
         async def do_connect() -> None:
-            await self._ble.connect(address=address, name=name, write_uuid=write_uuid)
+            await self._ble.connect(address=address, name=name, write_uuid=write_uuid, raw_device=raw_device)
             self._ble.set_last_device(address=address, name=name, write_uuid=write_uuid)
 
         fut = self._ble.submit(do_connect())
