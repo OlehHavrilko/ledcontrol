@@ -45,6 +45,7 @@ class BleController:
         self._queue: asyncio.Queue[tuple[bytes, str]] | None = None
         self._worker_task: asyncio.Task | None = None
         self._write_delay_s: float = 0.05
+        self._stopping = False
 
         self._last_device: dict[str, str] | None = None
 
@@ -61,12 +62,12 @@ class BleController:
     def stop(self) -> None:
         if not self._loop:
             return
-        fut = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
-        try:
-            fut.result(timeout=5)
-        except Exception:
-            pass
+        self._stopping = True
+        # Don't block the UI thread waiting for WinRT to unwind.
+        self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self._shutdown()))
         self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
 
     def submit(self, coro: Coroutine) -> "asyncio.Future":
         if not self._loop:
@@ -179,13 +180,16 @@ class BleController:
         loop.close()
 
     async def _shutdown(self) -> None:
+        if self._queue is not None:
+            with contextlib.suppress(Exception):
+                self._queue.put_nowait((b"", "__shutdown__"))
         try:
             await self.disconnect()
         except Exception:
             pass
         if self._worker_task:
             self._worker_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await self._worker_task
 
     def _on_disconnected(self, _client: BleakClient) -> None:
@@ -202,6 +206,8 @@ class BleController:
         assert self._queue is not None
         while True:
             data, label = await self._queue.get()
+            if self._stopping or label == "__shutdown__":
+                return
             try:
                 await self.ensure_connection()
                 if not self._client:
